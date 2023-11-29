@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 
@@ -105,7 +105,7 @@ func execCommand(cli *client.Client, containerID string, command []string) (stri
 	defer attachResp.Close()
 
 	// Read output
-	output, err := ioutil.ReadAll(attachResp.Reader)
+	output, err := io.ReadAll(attachResp.Reader)
 	if err != nil {
 		return "", err
 	}
