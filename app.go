@@ -9,15 +9,19 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/websocket"
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin:     func(r *http.Request) bool { return true },
-}
+var (
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     func(r *http.Request) bool { return true },
+	}
+	latestContainerID string
+)
 
 type WebSocketMessage struct {
 	Operation   string   `json:"operation"`
@@ -39,6 +43,7 @@ func createContainer(cli *client.Client) (string, error) {
 		return "", err
 	}
 
+	latestContainerID = resp.ID
 	fmt.Printf("Container %s created!\n", resp.ID)
 	return resp.ID, nil
 }
@@ -53,6 +58,19 @@ func startContainer(cli *client.Client, containerID string) error {
 	}
 
 	fmt.Printf("Started container! The Container ID is :%s\n", containerID)
+	return nil
+}
+
+func stopContainer(cli *client.Client, containerID string) error {
+	fmt.Println("Stopping container.......")
+
+	noWaitTimeout := 10
+	err := cli.ContainerStop(context.Background(), containerID, containertypes.StopOptions{Timeout: &noWaitTimeout})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Stopped container! The Container ID was: %s\n", containerID)
 	return nil
 }
 
@@ -146,7 +164,17 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "start":
-			err = startContainer(cli, msg.ContainerID)
+			var containerToStart string
+			if msg.ContainerID != "" {
+				containerToStart = msg.ContainerID
+			} else if latestContainerID != "" {
+				containerToStart = latestContainerID
+			} else {
+				log.Println("No containers available to start.")
+				continue
+			}
+
+			err = startContainer(cli, containerToStart)
 			if err != nil {
 				log.Printf("Error starting container: %v", err)
 				return
@@ -156,8 +184,39 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Error writing JSON: %v", err)
 			}
 
+		case "stop":
+			var containerToStop string
+			if msg.ContainerID != "" {
+				containerToStop = msg.ContainerID
+			} else if latestContainerID != "" {
+				containerToStop = latestContainerID
+			} else {
+				log.Println("No containers available to stop.")
+				continue
+			}
+
+			err := stopContainer(cli, containerToStop)
+			if err != nil {
+				log.Printf("Error stopping container: %v", err)
+				return
+			}
+			err = ws.WriteJSON(map[string]string{"status": "stopped"})
+			if err != nil {
+				log.Printf("Error writing JSON: %v", err)
+			}
+
 		case "delete":
-			err = deleteContainer(cli, msg.ContainerID)
+			var containerToDelete string
+			if msg.ContainerID != "" {
+				containerToDelete = msg.ContainerID
+			} else if latestContainerID != "" {
+				containerToDelete = latestContainerID
+			} else {
+				log.Println("No containers available to delete.")
+				continue
+			}
+
+			err = deleteContainer(cli, containerToDelete)
 			if err != nil {
 				log.Printf("Error deleting container: %v", err)
 				return
@@ -179,7 +238,17 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			}
 
 		case "exec":
-			output, err := execCommand(cli, msg.ContainerID, msg.Command)
+			var containerToExec string
+			if msg.ContainerID != "" {
+				containerToExec = msg.ContainerID
+			} else if latestContainerID != "" {
+				containerToExec = latestContainerID
+			} else {
+				log.Println("No containers available to execute command.")
+				continue
+			}
+
+			output, err := execCommand(cli, containerToExec, msg.Command)
 			if err != nil {
 				log.Printf("Error executing command: %v", err)
 				return
