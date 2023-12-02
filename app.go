@@ -40,11 +40,15 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 		Cmd:          command,
 	}
 
-	if strings.Contains(options, "-i") {
+	if strings.Contains(options, "i") {
 		execConfig.AttachStdin = true
 	}
-	if strings.Contains(options, "-t") {
+	if strings.Contains(options, "t") {
 		execConfig.Tty = true
+	}
+
+	if strings.Contains(options, "d") {
+		execConfig.Detach = true
 	}
 
 	execIDResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
@@ -107,9 +111,18 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		options := segments[2]
-		containerID := segments[3]
-		command := segments[4:]
+		var options string
+		var containerID string
+		var command []string
+
+		if strings.HasPrefix(segments[2], "-") {
+			options = segments[2]
+			containerID = segments[3]
+			command = segments[4:]
+		} else {
+			containerID = segments[2]
+			command = segments[3:]
+		}
 
 		output, err := execCommand(cli, containerID, command, options)
 		if err != nil {
