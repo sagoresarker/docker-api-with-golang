@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"fmt"
 	"log"
@@ -10,7 +10,6 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gorilla/websocket"
 
 	"github.com/google/shlex"
@@ -31,7 +30,7 @@ var (
 // 	Command     []string `json:"command"`
 // }
 
-func execCommand(cli *client.Client, containerID string, command []string, options string) ([]string, error) {
+func execCommand(cli *client.Client, containerID string, command []string, options string, ws *websocket.Conn) error {
 	ctx := context.Background()
 
 	execConfig := types.ExecConfig{
@@ -40,6 +39,7 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 		Cmd:          command,
 	}
 
+	// Check if the options include "-i" or "-t"
 	if strings.Contains(options, "i") {
 		execConfig.AttachStdin = true
 	}
@@ -47,32 +47,63 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 		execConfig.Tty = true
 	}
 
+	// Check if the options include "-d"
 	if strings.Contains(options, "d") {
 		execConfig.Detach = true
 	}
 
 	execIDResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
 	if err != nil {
-		return []string{}, err
+		return err
 	}
 
 	attachResp, err := cli.ContainerExecAttach(ctx, execIDResp.ID, types.ExecStartCheck{})
 	if err != nil {
-		return []string{}, err
+		return err
 	}
 	defer attachResp.Close()
 
-	var outputBuf, errorBuf bytes.Buffer
+	// Create a channel to signal when the command is done
+	done := make(chan error)
 
-	_, err = stdcopy.StdCopy(&outputBuf, &errorBuf, attachResp.Reader)
-	if err != nil {
-		return []string{}, err
+	// Start a goroutine to read the output
+	go func() {
+		defer close(done)
+
+		// Use a Scanner to read the output line by line
+		scanner := bufio.NewScanner(attachResp.Reader)
+		for scanner.Scan() {
+			line := scanner.Text()
+
+			// Write each line to the WebSocket connection
+			err := ws.WriteMessage(websocket.TextMessage, []byte(line))
+			if err != nil {
+				done <- err
+				return
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			done <- err
+			return
+		}
+		// Log before sending the __END__ message
+		log.Println("Sending __END__ message")
+
+		// Send the __END__ message after the command finishes executing
+		err := ws.WriteMessage(websocket.TextMessage, []byte("__END__"))
+		if err != nil {
+			done <- err
+			return
+		}
+	}()
+
+	// Wait for the command to finish
+	if err := <-done; err != nil {
+		return err
 	}
-	output := outputBuf.String() + errorBuf.String()
 
-	lines := strings.Split(string(output), "\n")
-
-	return lines, nil
+	return nil
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
@@ -108,6 +139,13 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				log.Printf("Error writing JSON: %v", err)
 			}
+
+			// Send the __END__ message
+			err = ws.WriteMessage(websocket.TextMessage, []byte("__END__"))
+			if err != nil {
+				log.Printf("Error sending __END__ message: %v", err)
+			}
+
 			continue
 		}
 
@@ -124,15 +162,10 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			command = segments[3:]
 		}
 
-		output, err := execCommand(cli, containerID, command, options)
-		if err != nil {
-			log.Printf("Error executing command: %v", err)
+		outputErr := execCommand(cli, containerID, command, options, ws)
+		if outputErr != nil {
+			log.Printf("Error executing command: %v", outputErr)
 			return
-		}
-		outputStr := strings.Join(output, "\n")
-		err = ws.WriteMessage(websocket.TextMessage, []byte(outputStr))
-		if err != nil {
-			log.Printf("Error writing message: %v", err)
 		}
 	}
 }
