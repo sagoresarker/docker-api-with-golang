@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/gorilla/websocket"
+
+	"github.com/google/shlex"
 )
 
 var (
@@ -21,40 +25,50 @@ var (
 	latestContainerID string
 )
 
-type WebSocketMessage struct {
-	Operation   string   `json:"operation"`
-	ContainerID string   `json:"containerID"`
-	Command     []string `json:"command"`
-}
+// type WebSocketMessage struct {
+// 	Operation   string   `json:"operation"`
+// 	ContainerID string   `json:"containerID"`
+// 	Command     []string `json:"command"`
+// }
 
-func execCommand(cli *client.Client, containerID string, command []string) (string, error) {
+func execCommand(cli *client.Client, containerID string, command []string, options string) ([]string, error) {
 	ctx := context.Background()
 
-	// Create exec instance
 	execConfig := types.ExecConfig{
 		AttachStdout: true,
 		AttachStderr: true,
 		Cmd:          command,
 	}
-	execIDResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
-	if err != nil {
-		return "", err
+
+	if strings.Contains(options, "-i") {
+		execConfig.AttachStdin = true
+	}
+	if strings.Contains(options, "-t") {
+		execConfig.Tty = true
 	}
 
-	// Attach to exec instance
+	execIDResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return []string{}, err
+	}
+
 	attachResp, err := cli.ContainerExecAttach(ctx, execIDResp.ID, types.ExecStartCheck{})
 	if err != nil {
-		return "", err
+		return []string{}, err
 	}
 	defer attachResp.Close()
 
-	// Read output
-	output, err := io.ReadAll(attachResp.Reader)
-	if err != nil {
-		return "", err
-	}
+	var outputBuf, errorBuf bytes.Buffer
 
-	return string(output), nil
+	_, err = stdcopy.StdCopy(&outputBuf, &errorBuf, attachResp.Reader)
+	if err != nil {
+		return []string{}, err
+	}
+	output := outputBuf.String() + errorBuf.String()
+
+	lines := strings.Split(string(output), "\n")
+
+	return lines, nil
 }
 
 func handleConnections(w http.ResponseWriter, r *http.Request) {
@@ -70,42 +84,42 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for {
-		var msg WebSocketMessage
-		err := ws.ReadJSON(&msg)
+		_, p, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading JSON: %v", err)
+			log.Printf("Error reading message: %v", err)
 			return
 		}
 
-		switch msg.Operation {
-		case "exec":
-			var containerToExec string
-			if msg.ContainerID != "" {
-				containerToExec = msg.ContainerID
-			} else if latestContainerID != "" {
-				containerToExec = latestContainerID
-			} else {
-				errMsg := "No containers available to execute command."
-				log.Println(errMsg)
-				err := ws.WriteJSON(map[string]string{"error": errMsg})
-				if err != nil {
-					log.Printf("Error writing JSON: %v", err)
-				}
-				continue
-			}
+		segments, err := shlex.Split(string(p))
+		if err != nil {
+			log.Printf("Error splitting command: %v", err)
+			return
+		}
+		fmt.Println(segments)
 
-			output, err := execCommand(cli, containerToExec, msg.Command)
-			if err != nil {
-				log.Printf("Error executing command: %v", err)
-				return
-			}
-			err = ws.WriteJSON(map[string]string{"output": output})
+		if len(segments) < 4 || segments[0] != "docker" || segments[1] != "exec" {
+			errMsg := "Invalid command. Format should be: 'docker exec [OPTIONS] CONTAINER COMMAND [ARG...]'"
+			log.Println(errMsg)
+			err := ws.WriteJSON(map[string]string{"error": errMsg})
 			if err != nil {
 				log.Printf("Error writing JSON: %v", err)
 			}
-		default:
-			log.Println("Invalid operation.")
-			fmt.Println("Invalid operation.")
+			continue
+		}
+
+		options := segments[2]
+		containerID := segments[3]
+		command := segments[4:]
+
+		output, err := execCommand(cli, containerID, command, options)
+		if err != nil {
+			log.Printf("Error executing command: %v", err)
+			return
+		}
+		outputStr := strings.Join(output, "\n")
+		err = ws.WriteMessage(websocket.TextMessage, []byte(outputStr))
+		if err != nil {
+			log.Printf("Error writing message: %v", err)
 		}
 	}
 }
