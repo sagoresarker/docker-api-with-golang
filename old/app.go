@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/gorilla/websocket"
 
@@ -24,13 +27,49 @@ var (
 	latestContainerID string
 )
 
-// type WebSocketMessage struct {
-// 	Operation   string   `json:"operation"`
-// 	ContainerID string   `json:"containerID"`
-// 	Command     []string `json:"command"`
-// }
+func createContainer(cli *client.Client) (string, error) {
+	ctx := context.Background()
 
-func execCommand(cli *client.Client, containerID string, command []string, options string, ws *websocket.Conn) error {
+	fmt.Println("Pulling ubuntu image...")
+	reader, err := cli.ImagePull(ctx, "ubuntu", types.ImagePullOptions{})
+	if err != nil {
+		return "", err
+	}
+	io.Copy(ioutil.Discard, reader)
+
+	fmt.Println("Creating container...")
+	resp, err := cli.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image:     "ubuntu",
+			Cmd:       []string{"/bin/bash"},
+			Tty:       true,
+			OpenStdin: true,
+		},
+		nil, nil, nil, "",
+	)
+	if err != nil {
+		return "", err
+	}
+
+	latestContainerID = resp.ID
+
+	fmt.Printf("Container %s created!\n", resp.ID)
+
+	fmt.Println("Starting container.......")
+
+	err = cli.ContainerStart(ctx, latestContainerID, types.ContainerStartOptions{})
+
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Printf("Started container! The Container ID is :%s\n", latestContainerID)
+
+	return resp.ID, nil
+}
+
+func execCommand(cli *client.Client, command []string, ws *websocket.Conn) error {
 	ctx := context.Background()
 
 	execConfig := types.ExecConfig{
@@ -39,20 +78,7 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 		Cmd:          command,
 	}
 
-	// Check if the options include "-i" or "-t"
-	if strings.Contains(options, "i") {
-		execConfig.AttachStdin = true
-	}
-	if strings.Contains(options, "t") {
-		execConfig.Tty = true
-	}
-
-	// Check if the options include "-d"
-	if strings.Contains(options, "d") {
-		execConfig.Detach = true
-	}
-
-	execIDResp, err := cli.ContainerExecCreate(ctx, containerID, execConfig)
+	execIDResp, err := cli.ContainerExecCreate(ctx, latestContainerID, execConfig)
 	if err != nil {
 		return err
 	}
@@ -63,19 +89,19 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 	}
 	defer attachResp.Close()
 
-	// Create a channel to signal when the command is done
 	done := make(chan error)
 
 	// Start a goroutine to read the output
 	go func() {
 		defer close(done)
 
-		// Use a Scanner to read the output line by line
 		scanner := bufio.NewScanner(attachResp.Reader)
 		for scanner.Scan() {
 			line := scanner.Text()
 
-			// Write each line to the WebSocket connection
+			// Replace invalid UTF-8 characters
+			line = strings.ToValidUTF8(line, "\uFFFD")
+
 			err := ws.WriteMessage(websocket.TextMessage, []byte(line))
 			if err != nil {
 				done <- err
@@ -87,10 +113,7 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 			done <- err
 			return
 		}
-		// Log before sending the __END__ message
-		log.Println("Sending __END__ message")
 
-		// Send the __END__ message after the command finishes executing
 		err := ws.WriteMessage(websocket.TextMessage, []byte("__END__"))
 		if err != nil {
 			done <- err
@@ -98,7 +121,6 @@ func execCommand(cli *client.Client, containerID string, command []string, optio
 		}
 	}()
 
-	// Wait for the command to finish
 	if err := <-done; err != nil {
 		return err
 	}
@@ -118,53 +140,27 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		log.Fatal(err)
 	}
 
+	_, err = createContainer(cli)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	for {
 		_, p, err := ws.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading message: %v", err)
+			log.Println(err)
 			return
 		}
 
-		segments, err := shlex.Split(string(p))
+		command, err := shlex.Split(string(p))
 		if err != nil {
-			log.Printf("Error splitting command: %v", err)
+			log.Println(err)
 			return
 		}
-		fmt.Println(segments)
 
-		if len(segments) < 4 || segments[0] != "docker" || segments[1] != "exec" {
-			errMsg := "Invalid command. Format should be: 'docker exec [OPTIONS] CONTAINER COMMAND [ARG...]'"
-			log.Println(errMsg)
-			err := ws.WriteJSON(map[string]string{"error": errMsg})
-			if err != nil {
-				log.Printf("Error writing JSON: %v", err)
-			}
-
-			// Send the __END__ message
-			err = ws.WriteMessage(websocket.TextMessage, []byte("__END__"))
-			if err != nil {
-				log.Printf("Error sending __END__ message: %v", err)
-			}
-
-			continue
-		}
-
-		var options string
-		var containerID string
-		var command []string
-
-		if strings.HasPrefix(segments[2], "-") {
-			options = segments[2]
-			containerID = segments[3]
-			command = segments[4:]
-		} else {
-			containerID = segments[2]
-			command = segments[3:]
-		}
-
-		outputErr := execCommand(cli, containerID, command, options, ws)
-		if outputErr != nil {
-			log.Printf("Error executing command: %v", outputErr)
+		err = execCommand(cli, command, ws)
+		if err != nil {
+			log.Println(err)
 			return
 		}
 	}
