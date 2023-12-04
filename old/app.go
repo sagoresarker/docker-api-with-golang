@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
@@ -13,9 +12,10 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/gorilla/websocket"
-
 	"github.com/google/shlex"
+	"github.com/gorilla/websocket"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 )
 
 var (
@@ -35,7 +35,7 @@ func createContainer(cli *client.Client) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	io.Copy(ioutil.Discard, reader)
+	io.Copy(io.Discard, reader)
 
 	fmt.Println("Creating container...")
 	resp, err := cli.ContainerCreate(
@@ -128,8 +128,8 @@ func execCommand(cli *client.Client, command []string, ws *websocket.Conn) error
 	return nil
 }
 
-func handleConnections(w http.ResponseWriter, r *http.Request) {
-	ws, err := upgrader.Upgrade(w, r, nil)
+func handleConnections(c echo.Context) error {
+	ws, err := upgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -149,27 +149,27 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		_, p, err := ws.ReadMessage()
 		if err != nil {
 			log.Println(err)
-			return
+			return err
 		}
 
 		command, err := shlex.Split(string(p))
 		if err != nil {
 			log.Println(err)
-			return
+			return err
 		}
 
 		err = execCommand(cli, command, ws)
 		if err != nil {
 			log.Println(err)
-			return
+			return err
 		}
 	}
 }
 
 func main() {
-	http.HandleFunc("/ws", handleConnections)
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		panic(err)
-	}
+	e := echo.New()
+	e.Use(middleware.Logger())
+	e.Use(middleware.Recover())
+	e.GET("/ws", handleConnections)
+	e.Start(":8080")
 }
